@@ -26,9 +26,9 @@ may be active. Inspect only needed fields; never print credentials.
 
 | Evidence | Next action |
 |---|---|
-| CLI reports signed out or unusable authentication | Follow [native login with ego-browser](references/ego-login.md). |
+| CLI reports signed out or unusable authentication | Follow [login with ego-browser](references/ego-login.md): native `codex login`, or Pool account re-authentication when `codexAccountMode` is `pool`. A revoked session strands every Pool account that shares it — re-authenticate each, not just the main. |
 | Added accounts have known short-window 100%; main has known weekly headroom and no short window | Follow [Main Account routing repair](references/main-account-repair.md). |
-| `Selected model is at capacity` / `server_overloaded` | Compare its timestamp with proxy restart/drain and upstream logs. Wait for readiness after drain; distinguish persistent upstream overload. |
+| `Selected model is at capacity` / `server_overloaded` | Compare its timestamp with proxy restart/drain and upstream logs. Wait for readiness after drain; distinguish persistent upstream overload. This message can also mask a `token_revoked` / `refresh_token_invalidated` 401 — check the attempt's real upstream status before concluding capacity. |
 | Dashboard looks healthy but CLI fails | Correlate the actual CLI request and its serving account before changing configuration. |
 
 A weekly-only account is not missing all quota information. Score its known
@@ -52,6 +52,9 @@ Use the existing authorized management interface; keep its secrets out of output
 - Require a completed minimal request **and the original client's serving-account
   log** after recovery. Keep the requested model unless the user authorizes a change.
   One minimal request from that original client can satisfy both checks.
+- When a revoked session stranded multiple Pool accounts, restore and verify
+  **each** account the fix is scoped to, not only the active main; disclose any
+  seat left unusable rather than removing it. Re-authenticate one flow at a time.
 - Report what changed, runtime readiness, account/result evidence, and any check
   that could not finish. Distinguish a local patch from an upstream release.
 
