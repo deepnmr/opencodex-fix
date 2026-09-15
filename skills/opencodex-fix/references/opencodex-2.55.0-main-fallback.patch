@@ -1,0 +1,462 @@
+diff --git a/docs-site/src/content/docs/ko/reference/configuration/providers.md b/docs-site/src/content/docs/ko/reference/configuration/providers.md
+index b6657ba..104060a 100644
+--- a/docs-site/src/content/docs/ko/reference/configuration/providers.md
++++ b/docs-site/src/content/docs/ko/reference/configuration/providers.md
+@@ -188,6 +188,15 @@ affinity 초기화 뒤의 기존 작업도 포함될 수 있습니다. 출력 
+ 정상적인 바인딩 작업은 affinity를 유지합니다. 이 전략들은 provider enforcement를 우회하지 않으며
+ 다계정 사용은 ToS 위반일 수 있습니다.
+ 
++선제 전환이 켜져 있으면 `fill-first`와 `round-robin`도 기존 작업의 계정 사용량이 100%에 도달했을 때,
++사용량이 더 낮고 실제 여유가 있는 다른 적격 계정으로 옮깁니다. 5시간 한도가 소진된 계정에서
++주간 한도만 있는 메인 계정으로도 전환하며, 5시간 한도 정보가 없다는 이유로 메인을 제외하지 않습니다.
++100% 미만에서는 기존 계정 고정을 유지합니다. `autoSwitchThreshold: 0`은 이 선제 전환을 끕니다.
++
++로컬 Codex CLI의 자동 Pool 요청은 클라이언트가 ChatGPT 토큰을 보내도 저장된 Main Account를 후보로 포함합니다.
++Direct 모드, 계정 직접 지정, Reserve 및 원격 요청은 기존 클라이언트 인증 분리를 유지합니다.
++저장된 인증을 사용할 수 없으면 검증된 클라이언트 토큰으로 해당 요청을 처리할 수 있습니다.
++
+ ### `anthropicAccountPool` (실험적)
+ 
+ 이 선택 기능은 이미 `auth.json`에 저장된 여러 Anthropic OAuth 계정을 함께 묶습니다. 기본값은 꺼짐이며 충분히 검증되지 않았습니다. 같은 조직의 계정은 할당량을 공유할 수 있고, 자동 순환은 공급자 제한을 유발할 수 있습니다.
+diff --git a/docs-site/src/content/docs/reference/configuration/providers.md b/docs-site/src/content/docs/reference/configuration/providers.md
+index 7eb8a12..830ecde 100644
+--- a/docs-site/src/content/docs/reference/configuration/providers.md
++++ b/docs-site/src/content/docs/reference/configuration/providers.md
+@@ -570,6 +570,17 @@ and pauses only accounts freshly confirmed at 100%; unknown or failed refreshes
+ | `round-robin` | Evenly assign unbound requests across eligible accounts. `autoSwitchThreshold` does not change normal round-robin selection. `accountPoolStickyLimit` (1–100) counts assignments on one pick, not successful upstream responses. |
+ | `fill-first` | Assign unbound requests to the active account until cooldown, reauthentication, or the configured drain threshold; unknown usage does not force a switch. Healthy bound tasks keep affinity. |
+ 
++With proactive switching enabled, `fill-first` and `round-robin` also move an existing bound task
++when its account reaches a reported 100% limit and another eligible account has genuine quota
++headroom and lower usage. This includes moving from an exhausted 5-hour account to a weekly-only
++main account; an absent 5-hour window does not exclude main. Below 100%, these strategies retain
++the binding. `autoSwitchThreshold: 0` keeps this proactive movement disabled.
++
++Local Codex CLI requests in automatic Pool mode also consider stored Main Account when the client
++sends its own ChatGPT token. Direct mode, explicit account selectors, Reserve, and remote requests
++retain caller credential isolation. If stored authentication is unavailable, the validated caller
++token can still serve as a request-only fallback.
++
+ Rotation does not protect against provider enforcement; multi-account use may violate provider terms.
+ 
+ ### `anthropicAccountPool` (experimental)
+diff --git a/src/codex/auth-context.ts b/src/codex/auth-context.ts
+index 7b0eb72..9ad9495 100644
+--- a/src/codex/auth-context.ts
++++ b/src/codex/auth-context.ts
+@@ -673,14 +673,22 @@ export async function resolveCodexAuthContext(
+ ): Promise<CodexAuthContext> {
+   const writerGeneration = captureConfigGeneration();
+   const policy = options.codexAuthPolicy ?? config;
+-  const requestScopedMainCredential = options.requestScopedMainCredential === true
++  const callerOwnedMainCredential = options.requestScopedMainCredential === true
+     && hasCallerCodexBearer(headers);
+   const reserve = requiresReserveAuthorization(policy, options.modelId, options.admission);
++  // Local automatic Pool routing owns the stored roster, including main. A native
++  // caller bearer is a fallback, not a reason to exclude a healthy premium seat.
++  // Direct, exact-account, reserve, and remote requests retain caller isolation.
++  const requestScopedMainCredential = callerOwnedMainCredential
++    && !(mode === "pool" && options.admission?.source === "loopback"
++      && options.accountId === undefined && !reserve);
+   if (reserve && (options.excludeAccountId !== undefined
+     || (options.accountId !== undefined && options.accountId !== MAIN_CODEX_ACCOUNT_ID))) {
+     throw new CodexReserveUnavailableError();
+   }
+   const fixedAccountId = reserve ? MAIN_CODEX_ACCOUNT_ID : options.accountId;
++  const canFallbackToCallerMain = callerOwnedMainCredential && fixedAccountId === undefined
++    && options.excludeAccountId !== MAIN_CODEX_ACCOUNT_ID;
+   const requestOwnedMainPinCandidate = requestScopedMainCredential
+     && fixedAccountId === undefined
+     && config.activeCodexAccountPinned === MAIN_CODEX_ACCOUNT_ID
+@@ -882,11 +890,7 @@ export async function resolveCodexAuthContext(
+       // main credential. Treating every exclusion as if main itself had failed strands a healthy
+       // native bearer after the first Pool attempt. Preserve the exactly-once boundary by refusing
+       // this fallback only when the excluded credential is main.
+-      if (
+-        requestScopedMainCredential
+-        && fixedAccountId === undefined
+-        && options.excludeAccountId !== MAIN_CODEX_ACCOUNT_ID
+-      ) {
++      if (canFallbackToCallerMain) {
+         return await resolveCallerOwnedMainContext();
+       }
+       if (fixedAccountId !== undefined) {
+@@ -1001,8 +1005,7 @@ export async function resolveCodexAuthContext(
+       // The selector can retain the configured Pool account when no stored
+       // alternate is eligible. A validated caller may still serve this request,
+       // just as it can after an upstream rejection, without changing Pool state.
+-      if (requestScopedMainCredential && fixedAccountId === undefined
+-        && options.excludeAccountId !== MAIN_CODEX_ACCOUNT_ID
++      if (canFallbackToCallerMain
+         && !callerIsCooledPoolAccount(headers, config, accountId)) {
+         return await resolveCallerOwnedMainContext();
+       }
+@@ -1028,12 +1031,16 @@ export async function resolveCodexAuthContext(
+       if (!options.signal?.aborted && shouldMarkAccountNeedsReauthForCodexAuthFailure(cause)) {
+         markAccountNeedsReauth(accountId, writerGeneration);
+       }
++      if (canFallbackToCallerMain && !options.signal?.aborted && cause instanceof MainAccountTokenRefreshError) {
++        return await resolveCallerOwnedMainContext();
++      }
+       throw new CodexAuthContextError(accountId, cause);
+     }
+     if (!token) {
+       // Nothing will reach upstream, so give the probe back instead of burning it.
+       if (probeLeaseId && probeQuotaScope) releaseCodexQuotaScopeProbeLease(accountId, probeQuotaScope, probeLeaseId);
+       else if (probeLeaseId) releaseCodexQuotaProbeLease(accountId, probeLeaseId);
++      if (canFallbackToCallerMain && !options.signal?.aborted) return await resolveCallerOwnedMainContext();
+       throw new CodexPoolAuthenticationError(
+         fixedAccountId !== undefined ? "Selected Codex account is unavailable" : undefined,
+       );
+diff --git a/src/codex/routing.ts b/src/codex/routing.ts
+index 51779de..7db1d6f 100644
+--- a/src/codex/routing.ts
++++ b/src/codex/routing.ts
+@@ -2502,29 +2502,24 @@ function previewReusableAffinityAccount(
+   if (accountPoolStrategyForScope(config, quotaScope) === "reset-first") {
+     return resetFirstAffinityReplacement(entry, config, now, quotaScope, selectionOptions) ?? entry.accountId;
+   }
+-  // Quota strategy only: non-quota strategies keep affinity for ongoing threads
+-  // (new-session-only rotation — docs / affinity policy A).
+-  if (accountPoolStrategyForScope(config, quotaScope) === "quota") {
+-    const threshold = config.autoSwitchThreshold ?? 80;
+-    if (threshold > 0) {
+-      const usage = computeCodexUsageScore(
+-        getAccountQuota(entry.accountId),
+-        getPoolAccountPlanForSelection(config, entry.accountId, selectionOptions),
++  const threshold = config.autoSwitchThreshold ?? 80;
++  if (threshold > 0) {
++    const usage = computeCodexUsageScore(
++      getAccountQuota(entry.accountId),
++      getPoolAccountPlanForSelection(config, entry.accountId, selectionOptions),
+       now,
++    );
++    // Preview and resolve share the same exhaustion and cache-affinity release rule.
++    if (mayRebindAffinityForQuota(config, entry.accountId, usage, threshold, selectionOptions)) {
++      const best = pickCacheSafeQuotaReplacement(
++        config,
++        entry.accountId,
++        usage,
++        now,
++        quotaScope,
++        selectionOptions,
+       );
+-      // Preview must agree with resolve: this is the second copy of the same rule, and the
+-      // suite asserts the two answer identically.
+-      if (mayRebindAffinityForQuota(config, entry.accountId, usage, threshold, selectionOptions)) {
+-        const best = pickCacheSafeQuotaReplacement(
+-          config,
+-          entry.accountId,
+-          usage,
+-          now,
+-          quotaScope,
+-          selectionOptions,
+-        );
+-        if (best) return best;
+-      }
++      if (best) return best;
+     }
+   }
+   return entry.accountId;
+@@ -2550,6 +2545,12 @@ function mayRebindAffinityForQuota(
+   threshold: number,
+   selectionOptions?: CodexAccountUsabilityOptions,
+ ): boolean {
++  const strategy = normalizeCodexAccountPoolStrategy(config.accountPoolStrategy);
++  // New-session ordering must not pin an existing thread to measured exhaustion.
++  // Below 100%, these strategies still keep the account's warmed prompt cache.
++  if (strategy === "fill-first" || strategy === "round-robin") {
++    return !isUnknownUsage(usage) && usage >= CODEX_EXHAUSTED_USAGE_PERCENT;
++  }
+   const overThreshold = threshold > 0 && !isUnknownUsage(usage) && usage >= threshold;
+   if (!isCacheAffinityEnabled(config)) return overThreshold;
+   // The usable half is already guaranteed by both callers, which gate on
+@@ -2636,7 +2637,7 @@ function pickCacheSafeQuotaReplacement(
+ }
+ 
+ /**
+- * Re-evaluate an affined account under the quota strategy. Returns a replacement
++ * Re-evaluate an affined account under the strategy's release policy. Returns a replacement
+  * that has genuine quota headroom and is strictly cooler than the bound account,
+  * or null when the current binding should remain (#4546).
+  */
+@@ -2653,7 +2654,6 @@ function reevaluateAffinityQuota(
+     if (replacement || now - entry.lastReevalAt >= CODEX_THREAD_AFFINITY_REEVAL_INTERVAL_MS) entry.lastReevalAt = now;
+     return replacement;
+   }
+-  if (strategy !== "quota") return null;
+   const threshold = config.autoSwitchThreshold ?? 80;
+   const usage = threshold > 0
+     ? computeCodexUsageScore(
+@@ -2909,8 +2909,8 @@ export function resolveCodexAccountForThreadDetailed(
+       // thread stays pinned for the full idle TTL (the WSL "never switches" report).
+       // Over-threshold pins re-eval immediately so a depleted primary does not keep
+       // serving for up to 60s after a secondary with quota is available (#584).
+-      // Non-quota strategies (RR / fill-first) keep affinity for ongoing threads —
+-      // rotation is new-session-only (affinity policy A).
++      // RR / fill-first keep ongoing affinity below exhaustion; a measured full
++      // quota can release the binding to an account with genuine headroom.
+       const cooler = reevaluateAffinityQuota(entry, config, now, quotaScope, selectionOptions);
+       if (cooler) {
+         if (!isIndependentCodexQuotaScope(quotaScope)) {
+diff --git a/structure/catalog.md b/structure/catalog.md
+index 47a8274..3970733 100644
+--- a/structure/catalog.md
++++ b/structure/catalog.md
+@@ -324,7 +324,7 @@ Provider `showThinkingSummary` is a Responses request default; it does not rewri
+ 
+ `src/codex/history-provider.ts` refuses external writes to paginated or migration-capable history. `src/codex/inject.ts` checks affected rows and manifest-owned restore targets before and after config/profile/journal changes, including successful journal and fallback restores, and compensates detected migration. Failed config restore stops later catalog/history work and rolls back a coordinated remove transition. See the [history writer contract](codex-home.md#paginated-history-writer-boundary) for guarantees and concurrent-writer limits.
+ 
+-Codex pool settings and their consumers follow the [reset-first ordering contract](providers/openai-tiers.md#reset-first-account-ordering), including independent-quota fallback and preserved affinity.
++Codex pool settings and their consumers follow the [reset-first ordering contract](providers/openai-tiers.md#reset-first-account-ordering), including independent-quota fallback and [exhaustion-aware bound-thread affinity](providers/openai-tiers.md#bound-thread-rebind-destination).
+ 
+ Claude replay carries [Go conversation affinity](data-planes/inbound-compat.md#claude-affinity-at-final-go-dispatch)
+ privately to final dispatch; preliminary route selection does not inject Go-only headers.
+diff --git a/structure/codex-home.md b/structure/codex-home.md
+index 339358e..7fc269a 100644
+--- a/structure/codex-home.md
++++ b/structure/codex-home.md
+@@ -274,4 +274,4 @@ Pool quota producers and account commands follow the [bounded raw-observation co
+ 
+ The account history response can include a [low-confidence effective capacity estimate](providers/openai-tiers.md#observed-effective-token-capacity); usage normalization retains local-answer provenance so local responses cannot supply samples.
+ 
+-Codex pool settings and their consumers follow the [reset-first ordering contract](providers/openai-tiers.md#reset-first-account-ordering), including independent-quota fallback and preserved affinity.
++Codex pool settings and their consumers follow the [reset-first ordering contract](providers/openai-tiers.md#reset-first-account-ordering), including independent-quota fallback and [exhaustion-aware bound-thread affinity](providers/openai-tiers.md#bound-thread-rebind-destination).
+diff --git a/structure/config.md b/structure/config.md
+index a4c0b97..f9f5fba 100644
+--- a/structure/config.md
++++ b/structure/config.md
+@@ -278,7 +278,7 @@ described in [Responses transport](transports/responses.md), not upstream policy
+ 
+ Private pool credential metadata follows the [quota-history publication identity contract](providers/openai-tiers.md#quota-history-publication-identity); credential-only and account DTO projections omit it.
+ 
+-Codex pool settings and their consumers follow the [reset-first ordering contract](providers/openai-tiers.md#reset-first-account-ordering), including independent-quota fallback and preserved affinity.
++Codex pool settings and their consumers follow the [reset-first ordering contract](providers/openai-tiers.md#reset-first-account-ordering), including independent-quota fallback and [exhaustion-aware bound-thread affinity](providers/openai-tiers.md#bound-thread-rebind-destination).
+ 
+ The Cline client keeps connection settings and models in a separate native file pair; client path overrides and reversible writes follow [Cline paired files](clients/integrations.md#cline-paired-files).
+ 
+diff --git a/structure/gui-and-management-api.md b/structure/gui-and-management-api.md
+index 0496735..ad9432b 100644
+--- a/structure/gui-and-management-api.md
++++ b/structure/gui-and-management-api.md
+@@ -575,7 +575,7 @@ The provider editor field policy exposes `showThinkingSummary` as a boolean prov
+ 
+ `src/codex/history-provider.ts` refuses external writes to paginated or migration-capable history. `src/codex/inject.ts` checks affected rows and manifest-owned restore targets before and after config/profile/journal changes, including successful journal and fallback restores, and compensates detected migration. Failed config restore stops later catalog/history work and rolls back a coordinated remove transition. See the [history writer contract](codex-home.md#paginated-history-writer-boundary) for guarantees and concurrent-writer limits.
+ 
+-Codex pool settings and their consumers follow the [reset-first ordering contract](providers/openai-tiers.md#reset-first-account-ordering), including independent-quota fallback and preserved affinity. Codex account DTOs and cards expose the routing-plan exclusion separately from credential health; the [plan exclusion contract](providers/openai-tiers.md#automatic-pool-plan-exclusions) also governs CLI projection. Private pool credential metadata follows the [quota-history publication identity contract](providers/openai-tiers.md#quota-history-publication-identity); credential-only and account DTO projections omit it.
++Codex pool settings and their consumers follow the [reset-first ordering contract](providers/openai-tiers.md#reset-first-account-ordering), including independent-quota fallback and [exhaustion-aware bound-thread affinity](providers/openai-tiers.md#bound-thread-rebind-destination). Codex account DTOs and cards expose the routing-plan exclusion separately from credential health; the [plan exclusion contract](providers/openai-tiers.md#automatic-pool-plan-exclusions) also governs CLI projection. Private pool credential metadata follows the [quota-history publication identity contract](providers/openai-tiers.md#quota-history-publication-identity); credential-only and account DTO projections omit it.
+ 
+ Claude replay carries [Go conversation affinity](data-planes/inbound-compat.md#claude-affinity-at-final-go-dispatch) privately to final dispatch; preliminary route selection does not inject Go-only headers.
+ 
+diff --git a/structure/ops/docs-and-release.md b/structure/ops/docs-and-release.md
+index f4474c6..9d14e3f 100644
+--- a/structure/ops/docs-and-release.md
++++ b/structure/ops/docs-and-release.md
+@@ -355,7 +355,7 @@ Provider configuration documents distinguish actual summaries from raw reasoning
+ 
+ Private pool credential metadata follows the [quota-history publication identity contract](../providers/openai-tiers.md#quota-history-publication-identity); credential-only and account DTO projections omit it.
+ 
+-Codex pool settings and their consumers follow the [reset-first ordering contract](../providers/openai-tiers.md#reset-first-account-ordering), including independent-quota fallback and preserved affinity.
++Codex pool settings and their consumers follow the [reset-first ordering contract](../providers/openai-tiers.md#reset-first-account-ordering), including independent-quota fallback and [exhaustion-aware bound-thread affinity](../providers/openai-tiers.md#bound-thread-rebind-destination).
+ 
+ Hub/browser pairing instructions distinguish machine enrollment, session authentication, permission denial and network failure. The hosted dashboard preview is the render artifact used to review these states.
+ The integrations guide documents Cline CLI as a two-file, loopback-only integration. Hosted CI validates its source-backed fixtures; the packaged dashboard exposes it through the existing client list.
+diff --git a/structure/providers/openai-tiers.md b/structure/providers/openai-tiers.md
+index a182474..0ead33f 100644
+--- a/structure/providers/openai-tiers.md
++++ b/structure/providers/openai-tiers.md
+@@ -280,8 +280,13 @@ pinned account and the effective active account are different questions, and the
+ both (`pinned` and `pinnedAccountId`). A surface that marks only the active account loses the pin from
+ view exactly when it is doing the most work — suppressing every higher tier.
+ 
+-A keyring-backed Codex request can carry its own forwardable ChatGPT bearer while the provider remains
+-in Pool mode. When the effective manual pin is `__main__`, main is not paused, and its cached quota still
++For local automatic Pool requests, a caller ChatGPT bearer does not exclude stored main from the
++roster. Main still passes the existing policy, quota, model, and turn-owned credential checks. If no
++stored account can serve, the validated caller bearer remains a request-only fallback. Direct, exact
++account selectors, Reserve, and remote admissions retain caller-credential isolation.
++
++Outside local automatic Pool routing, a keyring-backed Codex request can carry its own forwardable
++ChatGPT bearer while the provider remains in Pool mode. When the effective manual pin is `__main__`, main is not paused, and its cached quota still
+ has headroom, auth resolution validates the caller bearer's own gated-model roster and uses that
+ request-owned credential before stored-Pool selection. The credential never enters Pool persistence,
+ affinity, entitlement cache, or health state, and this decision never reads the physical main credential.
+@@ -523,7 +528,7 @@ The Codex parser in `src/oauth/pool-kernel.ts` is reexported by the compatibilit
+ 
+ ## Bound-thread rebind destination
+ 
+-A quota-strategy re-evaluation may move a LIVE thread binding only to an account that has genuine
++Usage-driven re-evaluation may move a LIVE thread binding only to an account that has genuine
+ quota headroom and is also strictly cooler than the bound account. Both bars are load-bearing.
+ Without the headroom bar, "strictly cooler" has no floor, so a pool whose every member sits in the
+ 80-100% band hands a long conversation from account to account on consecutive turns; Codex prompt
+@@ -543,6 +548,11 @@ headroom exists. Unbound assignment is untouched and still takes the coolest eli
+ because a fresh request has no warm prefix to lose. `pool.cacheAffinity` remains the stronger
+ opt-in, raising the bar from the threshold to genuine exhaustion.
+ 
++With proactive switching enabled, `fill-first` and `round-robin` apply this destination rule when
++a bound account reaches known 100% usage, including its 5-hour window. They preserve bindings
++below exhaustion regardless of `pool.cacheAffinity`. A weekly-only main account with observed
++headroom remains a destination without any short-window reading; unknown usage is not zero.
++
+ Two call sites need the rule — the live path in `reevaluateAffinityQuota` and the side-effect-free
+ `previewReusableAffinityAccount` that subagent fallback reads — and they share one helper rather
+ than restating it, because the suite asserts the two answer identically and a preview that
+diff --git a/structure/runtime.md b/structure/runtime.md
+index e4a50ba..e956509 100644
+--- a/structure/runtime.md
++++ b/structure/runtime.md
+@@ -370,7 +370,7 @@ Responses route normalization resolves provider summary defaults from the origin
+ 
+ `src/codex/history-provider.ts` refuses external writes to paginated or migration-capable history. `src/codex/inject.ts` checks affected rows and manifest-owned restore targets before and after config/profile/journal changes, including successful journal and fallback restores, and compensates detected migration. Failed config restore stops later catalog/history work and rolls back a coordinated remove transition. See the [history writer contract](codex-home.md#paginated-history-writer-boundary) for guarantees and concurrent-writer limits.
+ 
+-Codex pool settings and their consumers follow the [reset-first ordering contract](providers/openai-tiers.md#reset-first-account-ordering), including independent-quota fallback and preserved affinity.
++Codex pool settings and their consumers follow the [reset-first ordering contract](providers/openai-tiers.md#reset-first-account-ordering), including independent-quota fallback and [exhaustion-aware bound-thread affinity](providers/openai-tiers.md#bound-thread-rebind-destination).
+ 
+ Claude replay carries [Go conversation affinity](data-planes/inbound-compat.md#claude-affinity-at-final-go-dispatch)
+ privately to final dispatch; preliminary route selection does not inject Go-only headers.
+diff --git a/structure/subagents.md b/structure/subagents.md
+index 69047b0..8dbcf0f 100644
+--- a/structure/subagents.md
++++ b/structure/subagents.md
+@@ -345,7 +345,7 @@ Final-route summary visibility is recomputed after fallback from the original Re
+ 
+ `src/codex/history-provider.ts` refuses external writes to paginated or migration-capable history. `src/codex/inject.ts` checks affected rows and manifest-owned restore targets before and after config/profile/journal changes, including successful journal and fallback restores, and compensates detected migration. Failed config restore stops later catalog/history work and rolls back a coordinated remove transition. See the [history writer contract](codex-home.md#paginated-history-writer-boundary) for guarantees and concurrent-writer limits.
+ 
+-Codex pool settings and their consumers follow the [reset-first ordering contract](providers/openai-tiers.md#reset-first-account-ordering), including independent-quota fallback and preserved affinity.
++Codex pool settings and their consumers follow the [reset-first ordering contract](providers/openai-tiers.md#reset-first-account-ordering), including independent-quota fallback and [exhaustion-aware bound-thread affinity](providers/openai-tiers.md#bound-thread-rebind-destination).
+ 
+ Claude replay carries [Go conversation affinity](data-planes/inbound-compat.md#claude-affinity-at-final-go-dispatch)
+ privately to final dispatch; preliminary route selection does not inject Go-only headers.
+diff --git a/tests/codex-integration/codex-auth-context.test.ts b/tests/codex-integration/codex-auth-context.test.ts
+index b488bc7..b788a92 100644
+--- a/tests/codex-integration/codex-auth-context.test.ts
++++ b/tests/codex-integration/codex-auth-context.test.ts
+@@ -40,6 +40,7 @@ import { ConfigMutationLockError, getConfigPath } from "../../src/config";
+ import {
+   getMainAccountPlan,
+   MAIN_CODEX_ACCOUNT_ID,
++  MainAccountTokenRefreshError,
+   setMainAccountPlan,
+ } from "../../src/codex/main-account";
+ import {
+@@ -1111,6 +1112,82 @@ describe("Codex auth context", () => {
+     expect(cfg.activeCodexAccountId).toBe("pool-a");
+   });
+ 
++  test.each([false, true])("local Pool selects weekly-only stored main with a native bearer (retry=%s)", async (retry) => {
++    const cfg = { ...config(), accountPoolStrategy: "fill-first" as const, activeCodexAccountId: "pool-a" };
++    const authPath = join(testDir, "auth.json");
++    const originalAuth = JSON.stringify({ tokens: { access_token: "premium-main", account_id: "premium-account" } });
++    writeFileSync(authPath, originalAuth);
++    saveCodexAccountCredential("pool-a", {
++      accessToken: "pool-token", refreshToken: "pool-refresh", expiresAt: Date.now() + 3_600_000,
++      chatgptAccountId: "pool_acc",
++    });
++    setAccountQuotaFromParsed("pool-a", { weeklyPercent: 28, shortPercent: 100, shortResetAt: Date.now() + 3_600_000 });
++    setAccountQuotaFromParsed(MAIN_CODEX_ACCOUNT_ID, { weeklyPercent: 0 });
++    const inbound = new Headers({ authorization: "Bearer caller-token", "chatgpt-account-id": "caller-account" });
++    const turn = tryAdmitTurn();
++    expect(turn).not.toBeNull();
++    try {
++      const ctx = await resolveCodexAuthContext(inbound, cfg, "pool", {
++        admission: { source: "loopback" }, requestScopedMainCredential: true,
++        beginCodexAccountSelection: codexAccountSelectionForTurn(turn!),
++        ...(retry ? { excludeAccountId: "pool-a" } : {}),
++      });
++      expect(ctx).toMatchObject({ kind: "main-pool", accountId: MAIN_CODEX_ACCOUNT_ID });
++      expect(materializeCodexUpstreamAuth(inbound, ctx).get("authorization")).toBe("Bearer premium-main");
++      expect(readFileSync(authPath, "utf8")).toBe(originalAuth);
++    } finally {
++      turn?.release();
++    }
++  });
++
++  test("local Pool can still fall back to caller auth when no stored account exists", async () => {
++    const cfg = { ...config(), codexAccounts: [] };
++    const inbound = new Headers({ authorization: "Bearer keyring-token", "chatgpt-account-id": "keyring-account" });
++    const ctx = await resolveCodexAuthContext(inbound, cfg, "pool", {
++      admission: { source: "loopback" }, requestScopedMainCredential: true,
++    });
++    expect(ctx).toMatchObject({ kind: "main", accountId: null });
++    expect(materializeCodexUpstreamAuth(inbound, ctx).get("authorization")).toBe("Bearer keyring-token");
++  });
++
++  test.each(["reauth", "missing"] as const)("local Pool preserves caller fallback when stored main becomes %s", async (failure) => {
++    writeFileSync(join(testDir, "auth.json"), JSON.stringify({
++      tokens: { access_token: "stored-main", account_id: "stored-account" },
++    }));
++    const inbound = new Headers({ authorization: "Bearer caller-token", "chatgpt-account-id": "caller-account" });
++    try {
++      const ctx = await resolveCodexAuthContext(inbound, { ...config(), codexAccounts: [] }, "pool", {
++        admission: { source: "loopback" }, requestScopedMainCredential: true,
++        getValidMainAccountToken: async () => {
++          if (failure === "reauth") throw new MainAccountTokenRefreshError("reauth");
++          return null;
++        },
++      });
++      expect(ctx).toMatchObject({ kind: "main", accountId: null });
++      expect(materializeCodexUpstreamAuth(inbound, ctx).get("authorization")).toBe("Bearer caller-token");
++    } finally {
++      clearAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID);
++    }
++  });
++
++  test.each([
++    { mode: "direct" as const, source: "loopback" as const },
++    { mode: "pool" as const, source: "loopback" as const, accountId: MAIN_CODEX_ACCOUNT_ID },
++    { mode: "pool" as const, source: "dedicated" as const },
++  ])("caller isolation survives outside local automatic Pool: %j", async ({ mode, source, accountId }) => {
++    const cfg = { ...config(), codexAccounts: [] };
++    writeFileSync(join(testDir, "auth.json"), JSON.stringify({
++      tokens: { access_token: "stored-main", account_id: "stored-account" },
++    }));
++    const inbound = new Headers({ authorization: "Bearer caller-token", "chatgpt-account-id": "caller-account" });
++    const ctx = await resolveCodexAuthContext(inbound, cfg, mode, {
++      admission: { source }, accountId, requestScopedMainCredential: true,
++      getValidMainAccountToken: async () => { throw new Error("must not materialize stored main"); },
++    });
++    expect(ctx).toMatchObject({ kind: "main", accountId: null });
++    expect(materializeCodexUpstreamAuth(inbound, ctx).get("authorization")).toBe("Bearer caller-token");
++  });
++
+   test("uses a validated native caller bearer for main without persisting it", async () => {
+     const cfg = config();
+     cfg.codexAccounts = [];
+diff --git a/tests/codex-integration/codex-routing.test.ts b/tests/codex-integration/codex-routing.test.ts
+index b769a74..ec048e5 100644
+--- a/tests/codex-integration/codex-routing.test.ts
++++ b/tests/codex-integration/codex-routing.test.ts
+@@ -181,6 +181,32 @@ describe("codex routing", () => {
+     }
+   });
+ 
++  test.each(["fill-first", "round-robin"] as const)(
++    "%s moves an exhausted bound account to weekly-only main",
++    (strategy) => {
++      clearPoolRotationState();
++      const now = Date.now();
++      writeFileSync(join(TEST_DIR, "auth.json"), JSON.stringify({
++        tokens: { access_token: "main-access", account_id: "main-chatgpt-id" },
++      }));
++      const config = makeConfig({ accountPoolStrategy: strategy });
++      setAccountQuotaFromParsed("a", { weeklyPercent: 30, shortPercent: 10, shortResetAt: now + 3_600_000 });
++      setAccountQuotaFromParsed("b", { weeklyPercent: 28, shortPercent: 100, shortResetAt: now + 3_600_000 });
++      const poolOnly = { modelEligibleAccountIds: new Set(["a"]) };
++      expect(resolveCodexAccountForThreadDetailed("exhausted-bound", config, now, "shared", poolOnly))
++        .toMatchObject({ status: "selected", accountId: "a" });
++
++      setAccountQuotaFromParsed(MAIN_CODEX_ACCOUNT_ID, { weeklyPercent: 0, weeklyResetAt: now + 604_800_000 });
++      setAccountQuotaFromParsed("a", { weeklyPercent: 30, shortPercent: 99, shortResetAt: now + 3_600_000 });
++      expect(resolveCodexAccountForThread("exhausted-bound", config, now + 1, "shared")).toBe("a");
++      setAccountQuotaFromParsed("a", { weeklyPercent: 30, shortPercent: 100, shortResetAt: now + 3_600_000 });
++      expect(previewCodexAccountForRequest("exhausted-bound", config, now + 2, "shared"))
++        .toBe(MAIN_CODEX_ACCOUNT_ID);
++      expect(resolveCodexAccountForThread("exhausted-bound", config, now + 2, "shared"))
++        .toBe(MAIN_CODEX_ACCOUNT_ID);
++    },
++  );
++
+   test("usage score uses the hottest known quota window", () => {
+     expect(computeCodexUsageScore({ weeklyPercent: 81 })).toBe(81);
+     expect(computeCodexUsageScore({ weeklyPercent: 15, monthlyPercent: 91 })).toBe(91);
